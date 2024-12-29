@@ -1,205 +1,177 @@
-# トレーディング戦略用シミュレーションエンジン
+# SimulationEngine
+本ドキュメントでは、本リポジトリに含まれる SimulationEngine クラスの仕組み・目的・利用方法などを詳細に解説します。
+このエンジンは、過去の価格データを用いたバックテストを行うために設計されており、複数のポジション管理や部分クローズ、指値注文、テイクプロフィット/ストップロスなどの機能をサポートします。特徴は以下になります。
+- 過去データ(price_data) と Strategy を用意するだけで、複数アクションのシミュレーション を実行可能
+- 部分クローズ などの細かいロジックも再現
+- 戦略ロジック(キャンセル/アクション) → エンジン(約定/ポジション管理) → 結果保存 の責務分離により、柔軟に戦略を差し替えられる
+- 実運用システムに近い形でバックテストを回したい場合や、細かい発注ロジック、証拠金管理を再現したい場合は、現行の仕組みをさらに拡張することで柔軟に対応
 
 ## 概要
+SimulationEngine は、以下の主な機能を提供するバックテスト用シミュレーションエンジンです。
 
-`SimulationEngine` は、過去の価格データを使用してトレーディング戦略をシミュレートするためのPythonベースのバックテストフレームワークです。このエンジンは以下の機能を提供します：
+- 成り行き注文 / 指値注文
+- 指値注文の場合、価格が到達した時点でポジションをエントリー(買い/売り)
+- テイクプロフィット / ストップロス (TP/SL) 自動判定
+- ポジションに設定されている TP/SL の価格に相場が達した場合、自動でポジションをクローズし利益確定 or 損切り
+- 複数アクション (buy, sell, close_long, close_short...) を同一ステップで実行
+- Strategy 側が複数のアクションを返すと、同じローソク足(ステップ)内で順次実行
+- 部分クローズ対応
+- クローズ時にクローズサイズを指定でき、ポジションの一部だけを決済することが可能
+- 手数料計算
+- エントリー時およびクローズ時に手数料を計算し、実現損益(net_pnl)を正しく反映
+- 累積利益やトレード履歴の保存
+- 各ステップで生じた実現損益を累積し、最終的に profit_history に履歴を持つ
+- 取引の発生履歴(エントリー/クローズなど)を history に保存し、CSV 出力できる
+- バックテスト完了後に最終的な損益やドローダウン、シャープレシオなどの指標を自動で算出します。
 
-- 売買操作の実行とポジション管理
-- 残高、手数料、利益の追跡
-- 過去の市場データを用いた戦略のテスト
-- 詳細な取引履歴と利益履歴の出力
-
-このエンジンは柔軟で、カスタム戦略や手数料構造を組み込むことができます。
-
-## 必要条件
-
-- Python 3.8以上
-- 必要ライブラリ: `pandas`
-
-依存関係のインストール：
-
-```bash 
-# deb-bot下で以下を実行
-pip install -r requirements
-```
-
-## 動作の仕組み
-
-1. **初期化:** 初期残高、過去の価格データ、手数料計算関数、必要に応じて市場データ関数を指定します。
-2. **市場データ取得:** 戦略ロジック用の過去データを取得します。
-3. **取引実行:** 戦略の出力に基づいて売買操作を実行します。
-4. **利益計算:** 利益/損失を継続的に追跡し、取引履歴を保存します。
-
-## 使用例
-
-以下は `SimulationEngine` の使用方法の例です。
-
-### 1. エンジンの初期化
-
-```python
-import pandas as pd
-from simulation import SimulationEngine, fixed_fee, DummyStrategy
-
-# 価格データを読み込む
-price_data = pd.read_csv("price_data.csv")
-
-# エンジンを初期化
-engine = SimulationEngine(
-    initial_balance=10000,  # 初期残高（USD）
-    price_data=price_data,
-    fee_function=fixed_fee  # 固定手数料: 取引額の0.1%
-)
-
-dummy_strategy = DummyStrategy() # 取引ストラテジー
-engine.run_simulation(strategy=dummy_strategy, lookback_period=10)
-```
-
-### 2. 戦略の定義
-
-戦略は、`market_data`、`balance`、`positions` を入力とし、アクション（`buy`, `sell` など）と取引サイズを返す関数またはオブジェクトとして実装します。
-
-```python
-class DummyStrategy:
-    """
-    A simple strategy for testing:
-    Buys when the price is above the 5-period moving average.
-    Sells when the price is below the 5-period moving average.
-    """
-    def __call__(
-        self, market_data: pd.DataFrame, balance: Dict[str, float], positions: List[Dict]
-    ) -> Tuple[str, float]:
-        if market_data.empty:  # Skip if data is insufficient
-            return 'hold', 0
-
-        market_data = market_data.copy()  # 明示的にコピーを作成
-        market_data['ma'] = market_data['close'].rolling(window=5).mean()
-        current_price = market_data.iloc[-1]['close']
-        moving_average = market_data.iloc[-1]['ma']
-
-        long_position = next((pos for pos in positions if pos['type'] == 'long'), None)
-        short_position = next((pos for pos in positions if pos['type'] == 'short'), None)
-
-        if current_price > moving_average and not long_position:
-            return 'buy', balance['cash'] / current_price / 10
-        elif current_price < moving_average and long_position:
-            return 'close_long', long_position['size']
-        elif current_price < moving_average and not short_position:
-            return 'sell', balance['cash'] / current_price / 10
-        elif current_price > moving_average and short_position:
-            return 'close_short', short_position['size']
-        return 'hold', 0
-
-strategy = DummyStrategy()
-```
-
-### 3. シミュレーションの実行
-
-戦略とオプションでルックバック期間を指定してシミュレーションを実行します。
-
-```python
-engine.run_simulation(strategy=strategy, lookback_period=10)
-```
-
-### 4. 結果の分析
-
-シミュレーション結果（取引履歴と利益履歴）はCSVファイルに保存されます。
-
-- `trade_history.csv`: 各取引の詳細を含む
-- `profit_history.csv`: 時間経過に伴う利益の追跡
-
-## 主な構成要素
-
+## ファイル・クラス構造
 ### SimulationEngine
 
-シミュレーションを処理するコアクラスです。
+- バックテストの本体。
+- コンストラクタ(__init__) で初期残高・価格データ・手数料関数などを受け取り、シミュレーションの準備をする
+- run_simulation(strategy, lookback_period) を呼ぶと、ローソク足を1本ずつ進めながらトレードを実行
+- 全部完了後に generate_metrics() で最終的な損益・ドローダウン・シャープレシオを表示
+- save_results() で CSV (トレード履歴 / 損益履歴) を出力
 
-#### コンストラクタ:
+### fixed_fee(amount) (サンプル)
+- 取引額に対して 1% の固定手数料を返す例
 
+### MultiActionStrategy (サンプル)
+- 複数アクション (buy / sell / close_long / close_short ...) を同じステップで返すデモ用の戦略クラス
+### test_simulation()
+- 簡易テスト用メソッド。簡単な価格データを生成し、エンジンを動かすデモとして利用
+
+## SimulationEngine主要なメソッドの解説
+1. コンストラクタ: __init__
+    ```python
+    def __init__(
+        self, 
+        initial_balance: float, 
+        price_data: pd.DataFrame, 
+        fee_function: Callable[[float], float], 
+        output_dir: str = 'runs',
+        market_data_function: Optional[Callable[[int, int], pd.DataFrame]] = None
+    ) -> None:
+    ```
+    - initial_balance: シミュレーションの初期キャッシュ残高
+    - price_data: 過去の価格データ (pandas DataFrame)
+    - 少なくとも timestamp, open, high, low, close 列が必要
+    - fee_function: 取引手数料を計算する関数。amount -> fee のように実装
+    - output_dir: トレード履歴や損益履歴を出力するディレクトリ(デフォルトは "runs")
+    - market_data_function: 過去データをどう切り出すかを定義する関数。デフォルトでは default_market_data_function を使用
+
+    この段階で、下記のようなアトリビュートを初期化します:
+    - self.balance: {'cash': initial_balance} で、現在のキャッシュ残高を管理
+    - self.positions: ポジションをリスト形式で保持 (後述)
+    - self.open_orders: 未約定の指値注文リスト (後述)
+    - self.history: 取引履歴(ログ)
+    - self.profit_history: ステップごとに「累計実現損益」を記録
+    - self.total_fees: 累積手数料
+
+2. run_simulation(strategy, lookback_period)
+シミュレーションのメインループ。価格データ(price_data)の各行(ローソク足)を1ステップとして反復し、下記の順序で処理します  
+    1. process_open_orders(row)  
+        指値注文が約定可能かを判定( row['low'], row['high'] )
+        約定する場合は _execute_market_order(...) を呼び出し、ポジションを持つ
+    1. check_positions_tp_sl(row)  
+        すでに保有しているポジションの TP/SL 判定
+        該当すれば close_position(...) を呼んで実現損益を加算
+    1. strategy.cancel_orders(...)  
+        Strategy が「特定の注文をキャンセルしたい」と返すIDを受け取り、cancel_order(...) で取り消し
+    1. strategy(...) によるアクション実行  
+        戻り値が複数の (action, size, limit_price, tp, sl) のリストであれば順次処理
+        例: ('buy', 0.1, None, None, None) → submit_order('buy', ...)
+        ステップごとの実現損益を累計し、profit_history に記録
+
+    シミュレーションが終了したら generate_metrics() を呼び出して最終結果を表示し、save_results() で CSV 出力
+    戻り値として balance, history, profit_history を返す。
+
+3. 注文関連メソッド
+    1. submit_order(...)  
+    `(side, size, limit_price, take_profit, stop_loss)`  
+    limit_price があれば指値注文として open_orders に登録
+    なければ成り行き注文として _execute_market_order(...) を即時実行
+    1. _execute_market_order(...)    
+    'buy' or 'sell' を判定し、execute_buy(...)/execute_sell(...) を呼び出す
+    3. cancel_order(order_id)  
+    open_orders から該当IDの注文を削除
+    4. process_open_orders(row)  
+    open_orders を走査し、limit_price が row['low'] ~ row['high'] の範囲に達している注文を約定(= _execute_market_order)
+    約定した注文は open_orders から取り除く
+
+4. ポジション管理
+    1. execute_buy(...) / execute_sell(...)  
+    新規 or 既存ポジションのエントリー  
+    成り行き(または指値約定時)に呼び出される  
+    ロングの場合(execute_buy):  
+    cost = price * size 分 + 手数料 を balance['cash'] から引く   
+    既存ロングがあれば平均取得単価を再計算して追加、なければ新規作成  
+    entry_fee に手数料を加算  
+    ショートの場合(execute_sell):  
+    同様に cost + fee 分を証拠金として口座残高から引く(シンプル化モデル)  
+    ショートポジションを追加 or 既存ショートにサイズ上乗せ  
+    2. close_position(pos_idx, close_price, close_size=...)  
+    部分クローズ対応  
+    close_size が pos_size より小さければ一部のみ決済し、残りを保持
+    close_size が pos_size に等しければ全クローズ  
+    損益計算:  
+    gross_pnl = (close_price - entry_price) * close_size (ロングの場合; ショートは逆)  
+    close_fee = fee_function(...)  
+    partial_entry_fee = entry_fee * (close_size / pos_size) で按分  
+    net_pnl = gross_pnl - partial_entry_fee - close_fee  
+    口座残高 には、net_pnl + partial_entry_fee + (entry_price * close_size)(entry_feeを一部戻したうえで差し引くという実装ポリシー; シンプル化モデル)  
+    取引履歴(history) にクローズ情報を追加  
+5. TP/SL(テイクプロフィット/ストップロス)判定
+    ```python
+    def check_positions_tp_sl(self, current_row: pd.Series) -> float:
+        # ...
+    ```
+    ローソク足の high, low とポジションの take_profit / stop_loss を比較  
+    ロング なら  
+    sl is not None and low_ <= sl → 損切り  
+    tp is not None and high_ >= tp → 利確  
+    同時到達なら損切り優先  
+    ショートは逆  
+    引っかかったポジションは close_position(...) して損益を計上  
+    同メソッドを各ステップで呼び出し、自動的にポジションをクローズ  
+6. 損益履歴・メトリクス
+    1. profit_history  
+    「実現損益の累計」を各ステップで {'timestamp':..., 'profit':...} として記録
+    バックテストが進むごとに step_pnl を加算
+    2. generate_metrics()  
+    最終的に profit_history から
+    最終損益 (final_net_profit)
+    最大ドローダウン (max_drawdown)
+    シャープレシオ (sharpe_ratio)を計算して表示する
+    シャープレシオ計算は簡易的にprofit_series.pct_change() から算出、表示後、結果は標準出力に出力される
+7. 保存処理: save_results()  
+    history を trade_history.csv に出力
+    profit_history を profit_history.csv に出力
+    ディレクトリは output_dir 引数(デフォルトは 'runs')
+
+## 実行の流れ
+エンジン初期化:
 ```python
-SimulationEngine(
-    initial_balance: float,
-    price_data: pd.DataFrame,
-    fee_function: Callable[[float], float],
-    market_data_function: Optional[Callable[[int, int], pd.DataFrame]] = None
+engine = SimulationEngine(
+    initial_balance=10000.0,
+    price_data=some_price_data,
+    fee_function=fixed_fee
 )
 ```
-
-- `initial_balance`: 初期現金残高。
-- `price_data`: DataFrame形式の過去の価格データ。
-- `fee_function`: 取引手数料を計算する関数。
-- `market_data_function`: 市場データを取得するカスタム関数（オプション）。
-
-#### メソッド:
-
-- `get_market_data(timestamp, lookback_period)`: 市場データを取得。
-- `execute_buy(price, size)`: 買い注文を実行。
-- `execute_sell(price, size)`: 売り注文を実行。
-- `close_position(price, position_type)`: 既存のポジションをクローズ。
-- `run_simulation(strategy, lookback_period)`: バックテストシミュレーションを実行。
-- `save_results()`: 取引履歴と利益履歴をCSVに保存。
-
-### 手数料関数
-
-手数料ロジックをカスタマイズ可能。例：
-
+ストラテジー(戦略)定義:
 ```python
-def fixed_fee(amount: float) -> float:
-    return amount * 0.001  # 0.1% の手数料
+class MyStrategy:
+    def cancel_orders(self, open_orders, market_data, balance, positions):
+        return []
+    def __call__(self, market_data, balance, positions):
+        return [('buy', 0.1, None, None, None)]  # 例: 毎ステップ0.1BTC buy
 ```
-
-### 戦略ロジック
-
-カスタム戦略をコール可能なオブジェクトまたは関数として定義します。例：
-
+シミュレーション実行:
 ```python
-class DummyStrategy:
-    def __call__(self, market_data: pd.DataFrame, balance: Dict[str, float], positions: List[Dict]) -> Tuple[str, float]:
-        # 単純移動平均のロジック
-        market_data['ma'] = market_data['close'].rolling(window=5).mean()
-        current_price = market_data.iloc[-1]['close']
-        moving_average = market_data.iloc[-1]['ma']
-
-        if current_price > moving_average:
-            return 'buy', balance['cash'] / current_price
-        elif current_price < moving_average:
-            return 'sell', positions[0]['size'] if positions else 0
-        return 'hold', 0
+final_balance, history, profit_history = engine.run_simulation(
+    strategy=MyStrategy(),
+    lookback_period=10
+)
 ```
-
-### 市場データ関数
-
-デフォルトの市場データ関数は、過去データのスライドウィンドウを取得します。高度な要件にはオーバーライドします。
-
-```python
-def custom_market_data_function(timestamp: int, lookback_period: int) -> pd.DataFrame:
-    # カスタムロジックを実装
-    pass
-```
-
-## 戦略条件
-
-独自の戦略を定義する際には、以下を遵守してください：
-
-- **市場データの使用:** 提供された市場データ形式で動作すること。
-- **取引サイズ:** 利用可能な残高またはポジションサイズを反映した適切なサイズを返すこと。
-- **アクションの出力:** 有効なアクション（`buy`, `sell`, `close_long`, `close_short`, `hold`）を返すこと。
-
-## 出力
-
-エンジンは以下の2つの主要ファイルを生成します：
-
-- **`trade_history.csv`****:**
-  - 列: `action`, `price`, `size`, `fee`
-- **`profit_history.csv`****:**
-  - 列: `timestamp`, `profit`
-
-
-## テスト
-`test_simulation.py`に簡易なテストを実装している。以下コマンドでテストを実施できる。(取引回数が一回のため、シャープレシオ計算の際にpandas内部から警告を吐き出しているので、警告は無視してよい)
-```
-pytest test_simulation_class.py
-```
-
-## 注意点
-
-このエンジンは教育およびテスト目的で設計されています。決定論的な価格データを想定しており、板情報の動態やスリッページを考慮していません。より複雑なバックテストシステムの基盤として活用してください。
+結果の確認:  
+コンソール上に最終損益やシャープレシオ等が表示され、output_dir に CSV ファイルが保存  
